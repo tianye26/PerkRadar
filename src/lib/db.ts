@@ -39,6 +39,19 @@ export type SourceRunRow = {
   finishedAt: number | null;
 };
 
+/** Inbound SMS received on the owner's Telnyx number via webhook. Separate table; deals schema untouched. */
+export type SmsMessageRow = {
+  id: number;
+  messageId: string;
+  eventId: string | null;
+  fromNumber: string;
+  toNumber: string;
+  body: string;
+  type: string;
+  receivedAt: number;
+  createdAt: number;
+};
+
 let current: DatabaseSync | null = null;
 
 export function databaseFile(): string {
@@ -93,8 +106,20 @@ export function openDatabase(filename: string): DatabaseSync {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS sms_messages (
+      id INTEGER PRIMARY KEY,
+      message_id TEXT NOT NULL UNIQUE,
+      event_id TEXT,
+      from_number TEXT NOT NULL,
+      to_number TEXT NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
+      type TEXT NOT NULL DEFAULT 'SMS',
+      received_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_deals_source ON deals(source_id);
     CREATE INDEX IF NOT EXISTS idx_source_runs_round ON source_runs(round_id);
+    CREATE INDEX IF NOT EXISTS idx_sms_received ON sms_messages(received_at DESC, id DESC);
   `);
   migrateDatabase(db);
   return db;
@@ -294,6 +319,45 @@ export function insertSourceRun(input: Omit<SourceRunRow, "id">): void {
       input.startedAt,
       input.finishedAt,
     );
+}
+
+/** Store one inbound SMS. INSERT OR IGNORE dedupes Telnyx retries by message_id. Returns true when stored. */
+export function insertSmsMessage(input: Omit<SmsMessageRow, "id">): boolean {
+  const result = getDb()
+    .prepare(
+      `INSERT OR IGNORE INTO sms_messages (
+        message_id, event_id, from_number, to_number, body, type, received_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      input.messageId,
+      input.eventId,
+      input.fromNumber,
+      input.toNumber,
+      input.body,
+      input.type,
+      input.receivedAt,
+      input.createdAt,
+    );
+  return Number(result.changes) === 1;
+}
+
+export function listSmsMessages(limit = 100): SmsMessageRow[] {
+  const bounded = Math.max(1, Math.min(500, Math.floor(limit)));
+  return getDb()
+    .prepare("SELECT * FROM sms_messages ORDER BY received_at DESC, id DESC LIMIT ?")
+    .all(bounded)
+    .map((row) => ({
+      id: asNumber(row.id) ?? 0,
+      messageId: String(row.message_id),
+      eventId: row.event_id == null ? null : String(row.event_id),
+      fromNumber: String(row.from_number),
+      toNumber: String(row.to_number),
+      body: String(row.body ?? ""),
+      type: String(row.type ?? "SMS"),
+      receivedAt: asNumber(row.received_at) ?? 0,
+      createdAt: asNumber(row.created_at) ?? 0,
+    }));
 }
 
 /** Runs from the most recent finished round before `roundId`, for anomaly checks. */
